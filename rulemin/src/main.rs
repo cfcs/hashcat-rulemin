@@ -85,15 +85,23 @@ fn repl() -> rustyline::Result<()> {
                         let mut optimized = vec![];
                         rulelib::minimize_rule(&rule, &mut optimized);
                         table.add_row(Row::new(vec![
+                            TableCell::new_with_col_span(
+                                optimized.clone().into_iter().map(
+                                    |ins|ins.to_string()).collect::<Vec<_>>()
+                                    .join(" ")
+                                    , 4)
+                        ]));
+                        table.add_row(Row::new(vec![
                             TableCell::new_with_col_span(format!("{:?}", optimized), 4)
                         ]));
                         for word in dict.iter() {
                             let mut mangled = word.as_bytes().to_vec();
-                            rulelib::evaluate_rule(rule, &mut mangled);
+                            rulelib::evaluate_rule(rule.clone(), &mut mangled);
                             table.add_row({
                                 let mut r = Row::new(vec![
                                 TableCell::new_with_alignment(word, 2, Alignment::Left),
-                                TableCell::new_with_alignment(String::from_utf8(mangled).unwrap(), 2, Alignment::Right),
+                                    TableCell::new_with_alignment(
+                                        String::from_utf8(mangled).unwrap(), 2, Alignment::Right),
                                 ]);
                                 r.has_separator = false;
                                 r

@@ -18,11 +18,40 @@ pub enum Inst {
     DeleteLastCharacter,
     Omit(u8,u8), // Omit(N,M) delete M characters starting at pos N
     Swap(u8,u8), // Swap(N,M) character at position N with character at position M
+    // NB: Swap is a no-op if N or M >= pw.len()
       /* 'k' is a special case. note that swapping is commutative. */
     SwapBack, //  Swap last two characters
     Append(u8), // add char at the back
     Insert{off: u8, ch: u8}, // insert ch at offset off
     Overwrite{off: u8, ch: u8}, // overwrite ch at off
+}
+
+impl ToString for Inst {
+    fn to_string(&self) -> String {
+        use crate::Inst::*;
+        // see parse_inst0, parse_inst1, parse_inst1 etc
+        match self {
+            Noop        => {String::from(":")}
+            Lowercase   => {String::from("l")}
+            Uppercase   => {String::from("u")}
+            Reverse     => {String::from("r")}
+            RotateLeft  => {String::from("{")}
+            RotateRight => {String::from("}")}
+            DeleteLastCharacter => {String::from("]")}
+            Omit(0,1)  => { String::from("[") }
+            Omit(n,m)  => {
+                format!("O{}{}", unparse_offset(*n), unparse_offset(*m)) }
+            Swap(0,1)  => { String::from("k") }
+            Swap(n,m)  => {
+                format!("*{}{}", unparse_offset(*n), unparse_offset(*m)) }
+            SwapBack   => {String::from("K")}
+            Append(ch) => { format!("${}", *ch as char) }
+            Insert{off,ch}    => {
+                format!("i{}{}", unparse_offset(*off), *ch as char) }
+            Overwrite{off,ch} => {
+                format!("o{}{}", unparse_offset(*off), *ch as char) }
+        }
+    }
 }
 
 /*
@@ -260,6 +289,14 @@ fn parse_offset(i: &str) -> IResult<&str, u8, VerboseError<&str>> {
     ).parse(i)
 }
 
+fn unparse_offset(off: u8) -> char {
+    match off {
+        0 ..= 9 => { (off+0x30) as char}
+        10..=35 => { (off+0x41-10) as char}
+        _ => { panic!("offset out of range") }
+    }
+}
+
 /*
  * TODO: note that 'anychar' should accept
  * backslash-escaped hex too:
@@ -292,7 +329,8 @@ fn parse_inst2(i: &str) -> IResult<&str, Inst, VerboseError<&str>> {
         alt((
             preceded(char('*'), parse_offset.and(parse_offset)).map(|(n,m)| Swap(n,m)),
             preceded(char('O'), parse_offset.and(parse_offset)).map(|(n,m)| Omit(n,m)),
-            preceded(char('i'), parse_offset.and(hashcat_char)).map(|(n,m)| Insert{off:n,ch:m}),
+            preceded(char('o'), parse_offset.and(hashcat_char)).map(|(off,ch)| Overwrite{off,ch}),
+            preceded(char('i'), parse_offset.and(hashcat_char)).map(|(off,ch)| Insert{off,ch}),
         )))(i)
 }
 
@@ -307,6 +345,16 @@ fn parse_inst(i: &str) -> IResult<&str, Inst, VerboseError<&str>> {
             parse_inst1,
             parse_inst2,
         )))(i)
+}
+
+use core::str::FromStr;
+impl FromStr for Inst {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Inst, String> {
+        context("parse_inst", parse_inst)(s)
+            .map_err(|e: nom::Err<VerboseError<&str>>| format!("{:#?}", e))
+            .map(|(_loc, res)| res)
+    }
 }
 
 /*
