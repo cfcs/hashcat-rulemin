@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
@@ -70,6 +72,7 @@ fn repl() -> rustyline::Result<()> {
                 let mut table = term_table::Table::new();
                 table.max_column_width = 35;
                 table.style = TableStyle::thin();
+                /* Print user input: */
                 table.add_row({
                     let mut r = Row::new(vec![
                     TableCell::new_with_alignment(line, 4, Alignment::Center)
@@ -79,29 +82,40 @@ fn repl() -> rustyline::Result<()> {
                 });
                 match rulelib::parse_rule(line) {
                     Ok(rule) => {
+                        /* Opcode representation of parsed rule: */
                         table.add_row(Row::new(vec![
                             TableCell::new_with_col_span(format!("{:?}", rule), 4)
                         ]));
+                        /*
+                         * Minimize the rule and print the textual and opcode
+                         * representations:
+                         */
                         let mut optimized = vec![];
                         rulelib::minimize_rule(&rule, &mut optimized);
                         table.add_row(Row::new(vec![
-                            TableCell::new_with_col_span(
+                            TableCell::new_with_alignment(
                                 optimized.clone().into_iter().map(
                                     |ins|ins.to_string()).collect::<Vec<_>>()
                                     .join(" ")
-                                    , 4)
+                                    , 4, Alignment::Center)
                         ]));
                         table.add_row(Row::new(vec![
                             TableCell::new_with_col_span(format!("{:?}", optimized), 4)
                         ]));
+                        /*
+                         * Apply the rule to each dictionary word:
+                         */
                         for word in dict.iter() {
                             let mut mangled = word.as_bytes().to_vec();
                             rulelib::evaluate_rule(rule.clone(), &mut mangled);
                             table.add_row({
                                 let mut r = Row::new(vec![
-                                TableCell::new_with_alignment(word, 2, Alignment::Left),
+                                    /* Original: */
+                                    TableCell::new_with_alignment(word, 2, Alignment::Left),
+                                    /* After applying rule: */
                                     TableCell::new_with_alignment(
-                                        String::from_utf8(mangled).unwrap(), 2, Alignment::Right),
+                                        String::from_utf8(mangled).unwrap(),
+                                        2, Alignment::Right),
                                 ]);
                                 r.has_separator = false;
                                 r

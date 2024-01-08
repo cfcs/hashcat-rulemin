@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 /*
  * Parser for a subset of the rules detailed here:
  * https://hashcat.net/wiki/doku.php?id=rule_based_attack
@@ -16,6 +17,8 @@ pub enum Inst {
     RotateLeft,
     RotateRight,
     DeleteLastCharacter,
+    Extract(u8,u8), // Extract(N,M) delete everything not in range [N:M].
+    // M is allowed to overshoot.
     Omit(u8,u8), // Omit(N,M) delete M characters starting at pos N
     Swap(u8,u8), // Swap(N,M) character at position N with character at position M
     // NB: Swap is a no-op if N or M >= pw.len()
@@ -24,11 +27,14 @@ pub enum Inst {
     Append(u8), // add char at the back
     Insert{off: u8, ch: u8}, // insert ch at offset off
     Overwrite{off: u8, ch: u8}, // overwrite ch at off
+    Purge(u8), // Purge(ch): delete all ch - '@x' Purge(b'x') deletes all 'x'
+    Replace(u8,u8), // Replace(S,R) replaces all S with R 'sSR'
 }
 
 impl ToString for Inst {
     fn to_string(&self) -> String {
         use crate::Inst::*;
+        // TODO need to output proper escaping here
         // see parse_inst0, parse_inst1, parse_inst1 etc
         match self {
             Noop        => {String::from(":")}
@@ -38,6 +44,8 @@ impl ToString for Inst {
             RotateLeft  => {String::from("{")}
             RotateRight => {String::from("}")}
             DeleteLastCharacter => {String::from("]")}
+            Extract(n,m) => {
+                format!("x{}{}", unparse_offset(*n), unparse_offset(*m)) }
             Omit(0,1)  => { String::from("[") }
             Omit(n,m)  => {
                 format!("O{}{}", unparse_offset(*n), unparse_offset(*m)) }
@@ -50,6 +58,9 @@ impl ToString for Inst {
                 format!("i{}{}", unparse_offset(*off), *ch as char) }
             Overwrite{off,ch} => {
                 format!("o{}{}", unparse_offset(*off), *ch as char) }
+            Purge(ch) => {format!("@{}", *ch as char)}
+            Replace(ch_s,ch_r) => {
+                format!("s{}{}", *ch_s as char, *ch_r as char)}
         }
     }
 }
@@ -107,6 +118,21 @@ pub fn minimize_rule(input: &Vec<Inst>, output: &mut Vec<Inst>) {
                 (Append(_), Some(DeleteLastCharacter)) => {
                     skipping = Some(idx+1)
                 }
+                /* Adding a character and then purging it makes the Append
+                 * a no-op (but we should retain the Purge). */
+                (Append(a_ch), Some(Purge(p_ch))) if (a_ch == p_ch) => {
+                    skipping = Some(idx)
+                }
+                /* Same for Insert{ch}, Purge(ch) */
+                (Insert{ch: a_ch, ..}, Some(Purge(p_ch))) if (a_ch == p_ch) => {
+                    skipping = Some(idx)
+                }
+                /* Overwrite(ch),Purge(ch) can be simplifed to Omit:
+                // But we can't do that here without invalidating our totality claim
+                (Overwrite{ch: a_ch, off}, Some(Purge(p_ch))) if (a_ch == p_ch) => {
+                    output.push(Omit(off, 1));
+                    skipping = Some(idx)
+                }*/
                 /* insert_omit_noop
                  * Insert(0,Z), Omit(0) => Noop*/
                 (Insert{off,ch}, Some(Omit(opos, olen))) if (opos == off) => {
@@ -136,6 +162,14 @@ pub fn minimize_rule(input: &Vec<Inst>, output: &mut Vec<Inst>) {
                 (RotateLeft, Some(RotateRight)) => { skipping = Some(idx+1) }
                 /* i0a i0b D1 => i0b */
 
+                /* Purging the same character twice is idempotent */
+                (Purge(ch1), Some(Purge(ch2))) if (ch1 == ch2) => {
+                    skipping = Some(idx);
+                }
+                /* Replacing twice does no good either: */
+                (Replace(a,b), Some(Replace(a2,b2))) if (a==a2 && b==b2) => {
+                    skipping = Some(idx);
+                }
                 /* Collapse Uppercase/Lowercase (one is enough):
                  * We could be more aggressive about this one;
                  * as long as nothing is memorized ('M'), added, etc,
@@ -177,11 +211,17 @@ pub fn minimize_rule(input: &Vec<Inst>, output: &mut Vec<Inst>) {
                 break;
             }
             Some(_) => {
-                assert!(input.len() > output.len()); // output is smaller
-                assert!(workvec.len() > output.len()); // we made progress
+                /*
+                 * Ensure termination / totality / that we make progress
+                 * instead of hitting endless loops.
+                 */
+                 // output is smaller, in general (minifier works):
+                assert!(input.len() > output.len());
+                // this pass made it smaller (we made progres):
+                assert!(workvec.len() > output.len());
                 workvec.truncate(0);
-                for &lol in output.iter() {
-                    workvec.push(lol);
+                for &inst in output.iter() {
+                    workvec.push(inst);
                 }
                 output.truncate(0);
                 //println!("rewrote {:?}\nto\t{:?}", input, workvec);
@@ -225,6 +265,16 @@ pub fn evaluate_inst(inst: Inst, input: &mut Vec<u8>) {
                 input.truncate(input.len()-1);
             }
         }
+        Extract(pos,amount) => {
+            let pos = pos as usize;
+            if pos < input.len() { // x is no-op when pos >= len
+                let extracted = input[
+                    (pos as usize)..std::cmp::min(pos+amount as usize, input.len())
+                ].to_vec();
+                input.clear();
+                input.extend(extracted);
+            }
+        }
         Omit(pos, amount) => {
             /* clip to bounds: */
             let pos = std::cmp::min(pos as usize, input.len());
@@ -255,6 +305,16 @@ pub fn evaluate_inst(inst: Inst, input: &mut Vec<u8>) {
             /* TODO uncertain how this should react to OOB writes */
             if (off as usize) < input.len() {
                 input[off as usize] = ch;
+            }
+        }
+        Purge(ch) => {
+            input.retain(|&o| o != ch);
+        }
+        Replace(old_ch, new_ch) => {
+            for cur in input.iter_mut() {
+                if *cur == old_ch {
+                    *cur = new_ch;
+                }
             }
         }
     }
@@ -342,6 +402,7 @@ fn parse_inst1(i: &str) -> IResult<&str, Inst, VerboseError<&str>> {
         "inst/1",
         alt((
             preceded(char('D'), parse_offset).map(|off| Inst::Omit(off,1)),
+            preceded(char('@'), hashcat_char).map(|ch| Purge(ch)),
             preceded(char('$'), hashcat_char).map(|ch| Append(ch)),
             preceded(char('^'), hashcat_char).map(|ch| Insert{off:0,ch}),
         )))(i)
@@ -357,8 +418,10 @@ fn parse_inst2(i: &str) -> IResult<&str, Inst, VerboseError<&str>> {
         alt((
             preceded(char('*'), parse_offset.and(parse_offset)).map(|(n,m)| Swap(n,m)),
             preceded(char('O'), parse_offset.and(parse_offset)).map(|(n,m)| Omit(n,m)),
+            preceded(char('x'), parse_offset.and(parse_offset)).map(|(n,m)| Extract(n,m)),
             preceded(char('o'), parse_offset.and(hashcat_char)).map(|(off,ch)| Overwrite{off,ch}),
             preceded(char('i'), parse_offset.and(hashcat_char)).map(|(off,ch)| Insert{off,ch}),
+            preceded(char('s'), hashcat_char.and(hashcat_char)).map(|(old,new)| Replace(old,new)),
         )))(i)
 }
 
@@ -416,6 +479,21 @@ mod tests {
         assert_eq!(parse_offset("1"), Ok(("", 1)));
         assert_eq!(parse_offset("9"), Ok(("", 9)));
         assert_eq!(parse_offset("A"), Ok(("", 10)));
+    }
+
+    #[test]
+    fn test_unparse_offset() {
+        /* best-effort test that unparse_offset roughly corresponds
+         * to parse_offset, at least for legal values.
+         */
+        for ch in '\x00'..='\x7f' {
+            match parse_offset(&String::from(ch)) {
+                Ok((_, off)) => {
+                    assert_eq!(ch, unparse_offset(off))
+                }
+                Err(_) => { /* ideally would ensure nothing decode to this */ }
+            }
+        }
     }
 
     /*
@@ -525,6 +603,16 @@ mod tests {
         minimize_rule(&rule, &mut rule_out);
         assert_eq!(vec![Insert{off:0,ch:b'x'}], rule_out);
 
+        let rule = vec![Append(b'a'), Purge(b'a')];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Purge(b'a')], rule_out);
+
+        let rule = vec![Insert{off:0,ch:b'a'}, Purge(b'a')];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Purge(b'a')], rule_out);
+
     }
 
     #[test]
@@ -536,6 +624,7 @@ mod tests {
         assert_eq!(parse_inst("{"), Ok(("", Inst::RotateLeft)));
         assert_eq!(parse_inst("}"), Ok(("", Inst::RotateRight)));
         assert_eq!(parse_inst("k"), Ok(("", Inst::Swap(0,1))));
+        assert_eq!(parse_inst("K"), Ok(("", Inst::SwapBack)));
         assert_eq!(parse_inst("["), Ok(("", Inst::Omit(0,1))));
         assert_eq!(parse_inst("]"), Ok(("", Inst::DeleteLastCharacter)));
         assert_eq!(parse_inst("D0"), Ok(("", Inst::Omit(0,1))));
@@ -544,6 +633,10 @@ mod tests {
         assert_eq!(parse_inst("*10"), Ok(("", Inst::Swap(1,0))));
         assert_eq!(parse_inst("$a"), Ok(("", Inst::Append('a' as u8))));
         assert_eq!(parse_inst("O47"), Ok(("", Inst::Omit(4,7))));
+        assert_eq!(parse_inst("i4x"), Ok(("", Inst::Insert{off:4,ch:b'x'})));
+        assert_eq!(parse_inst("o4x"), Ok(("", Inst::Overwrite{off:4,ch:b'x'})));
+        assert_eq!(parse_inst("@4"), Ok(("", Inst::Purge(b'4'))));
+        assert_eq!(parse_inst("s47"), Ok(("", Inst::Replace(b'4',b'7'))));
         //assert_eq!(parse_inst("x"), Ok(("", Inst::Noop)));
     }
 
@@ -671,6 +764,60 @@ mod tests {
     }
 
     /*
+     * Check that starting offset >= input.len() is a no-op
+     */
+    #[test]
+    fn test_minimize_rule_regression_06_extract_oob_index() {
+        let pw = vec![b'A',b'B',b'C'];
+        let rule = parse_rule("xK1").unwrap();
+        let mut mangled_big = pw.to_vec();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        assert_eq!(vec![b'A',b'B',b'C'], mangled_big,
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+        let rule = parse_rule("x31").unwrap();
+        let mut mangled_big = pw.to_vec();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        assert_eq!(vec![b'A',b'B',b'C'], mangled_big,
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+        let rule = parse_rule("x30").unwrap();
+        let mut mangled_big = pw.to_vec();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        assert_eq!(vec![b'A',b'B',b'C'], mangled_big,
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+        let rule = parse_rule("x21").unwrap();
+        let mut mangled_big = pw.to_vec();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        assert_eq!(vec![b'C'], mangled_big,
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+        /* entire range (overshooting): */
+        let rule = parse_rule("x0K").unwrap();
+        let mut mangled_big = pw.to_vec();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        assert_eq!(vec![b'A',b'B',b'C'], mangled_big,
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+        /*
+         * smaller range:
+         * # echo 'abc' | hashcat --stdout -j 'x02'
+         * ab
+         */
+        let rule = parse_rule("x02").unwrap();
+        let mut mangled_big = pw.to_vec();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        assert_eq!(vec![b'A',b'B'], mangled_big,
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+        /*
+         * empty range:
+         * # echo 'abc' | hashcat --stdout -j 'x10'
+         *
+         */
+        let rule = parse_rule("x00").unwrap();
+        let mut mangled_big = pw.to_vec();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        assert_eq!(mangled_big, vec![],
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+    }
+
+    /*
      * Tests for evaluation of instruction that take offsets that might point
      * somewhere outside of the candidate buffer. Mainly here to ensure these
      * don't result in panics.
@@ -723,6 +870,10 @@ mod tests {
         let mut arr = vec![b'A',b'b',b'C'];
         evaluate_inst(Inst::Noop, &mut arr);
         assert_eq!(arr, [b'A',b'b',b'C']);
+        evaluate_inst(Inst::Replace(b'b',b'0'), &mut arr);
+        assert_eq!(arr, [b'A',b'0',b'C']);
+        evaluate_inst(Inst::Replace(b'0',b'b'), &mut arr);
+        assert_eq!(arr, [b'A',b'b',b'C']);
         evaluate_inst(Inst::Append(0x64), &mut arr);
         assert_eq!(arr, [b'A', b'b', b'C', b'd']);
         evaluate_inst(Inst::Uppercase, &mut arr);
@@ -774,5 +925,16 @@ mod tests {
         assert_eq!(arr, [b'C',b'2',b'1',b'B',b'A', b'3']);
         evaluate_inst(Inst::Omit(1,2), &mut arr);
         assert_eq!(arr, [b'C',b'B',b'A', b'3']);
+        evaluate_inst(Inst::Extract(1,2), &mut arr);
+        assert_eq!(arr, [b'B',b'A',]);
+        evaluate_inst(Inst::Append(b'c'), &mut arr);
+        evaluate_inst(Inst::Append(b'd'), &mut arr);
+        assert_eq!(arr, [b'B',b'A',b'c',b'd']);
+        evaluate_inst(Inst::Extract(1,3), &mut arr);
+        assert_eq!(arr, [b'A',b'c',b'd']);
+        evaluate_inst(Inst::Extract(1,10), &mut arr);
+        assert_eq!(arr, [b'c',b'd']);
+        evaluate_inst(Inst::Purge(b'd'), &mut arr);
+        assert_eq!(arr, [b'c']);
     }
 }
