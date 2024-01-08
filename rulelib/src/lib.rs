@@ -89,32 +89,58 @@ pub fn minimize_rule(input: &Vec<Inst>, output: &mut Vec<Inst>) {
                 ) => { skipping = Some(idx+1) }
                 /* Append, RotateRight, Omit(0,1) is noop */
                 /* Append(Z), RotateRight => Insert(0,Z) */
-
+                (Append(ch), Some(RotateRight)) => {
+                    skipping = Some(idx+1);
+                    output.push(Insert{off:0,ch});
+                }
+                /* conversely ^a{ is $a:*/
+                (Insert{off:0,ch}, Some(RotateLeft)) => {
+                    skipping = Some(idx+1);
+                    output.push(Append(ch));
+                }
+                /* overwriting something just inserted, we turn it into Insert: */
+                (Insert{off:ioff,ch:_}, Some(Overwrite{off:ooff,ch})) if ioff == ooff => {
+                    skipping = Some(idx+1);
+                    output.push(Insert{off:ioff, ch});
+                }
+                /* $a ] is a no-op: */
+                (Append(_), Some(DeleteLastCharacter)) => {
+                    skipping = Some(idx+1)
+                }
                 /* insert_omit_noop
                  * Insert(0,Z), Omit(0) => Noop*/
-                (Insert{off,ch:_}, Some(Omit(opos, olen))) if (
-                    false && /* */
-                    (opos == off)) => {
+                (Insert{off,ch}, Some(Omit(opos, olen))) if (opos == off) => {
                     // it's definitely going away
-                    if olen == 1 { // becomes 0 after decrementing
-                        output.push(Noop);
-                    } else {
-                        // opos +1 (insert pos) -1 (inserted value)== opos
-                        output.push(Omit(opos, olen-1));
+                    match olen {
+                        1 => { // becomes 0 after decrementing
+                            output.push(Noop);
+                        }
+                        0 => { // Omit(_,0) is a no-op:
+                            output.push(Insert{off,ch});
+                        }
+                        _ => {
+                            // opos +1 (insert pos) -1 (inserted value)== opos
+                            output.push(Omit(opos, olen-1));
+                        }
                     }
                     skipping = Some(idx+1);
                 }
                 /* Insert{off=0,ch}, Some(Swap(0,1)) => Insert(x,ch) */
-                (Insert{off: 0,ch}, Some(Swap(0,1))) => {
+                /*(Insert{off: 0,ch}, Some(Swap(0,1))) => {
                     /* should be a more generalizable */
                     skipping = Some(idx+1);
                     output.push(Insert{off: 1, ch});
-                }
+                }*/
                 /* Rotating forth and back is a no-op: */
                 (RotateRight, Some(RotateLeft)) => { skipping = Some(idx+1) }
                 (RotateLeft, Some(RotateRight)) => { skipping = Some(idx+1) }
                 /* i0a i0b D1 => i0b */
-                /* Collapse Uppercase/Lowercase (one is enough): */
+
+                /* Collapse Uppercase/Lowercase (one is enough):
+                 * We could be more aggressive about this one;
+                 * as long as nothing is memorized ('M'), added, etc,
+                 * we could look ahead like "u [ } l" => l
+                 */
                 (Uppercase, Some(Uppercase)) => { output.push(e);
                                                   skipping = Some(idx+1) }
                 (Lowercase, Some(Lowercase)) => { output.push(e);
@@ -123,6 +149,7 @@ pub fn minimize_rule(input: &Vec<Inst>, output: &mut Vec<Inst>) {
                     skipping=Some(idx); /* don't push Uppercase */ }
                 (Lowercase, Some(Uppercase)) => {
                     skipping=Some(idx); /* don't push Lowercase */ }
+
                 /* Collapse overlapping delete/omit: */
                 (Omit(pos1, o1), Some(Omit(pos2,o2))) if (
                     pos1 == pos2
@@ -219,9 +246,10 @@ pub fn evaluate_inst(inst: Inst, input: &mut Vec<u8>) {
         },
         Append(ch) => { input.push(ch); }
         Insert{off,ch} => {
-            /* turns into append when OOB: */
-            let off = std::cmp::min(off as usize, input.len());
-            input.splice(off as usize .. off as usize, [ch]);
+            /* ignored when OOB: */
+            if (off as usize) <= input.len() {
+                input.splice(off as usize .. off as usize, [ch]);
+            }
         }
         Overwrite{off,ch} => {
             /* TODO uncertain how this should react to OOB writes */
@@ -439,10 +467,13 @@ mod tests {
         let rule = vec![Reverse,Reverse]; let mut rule_out = vec![];
         minimize_rule(&rule, &mut rule_out); assert_eq!(vec![Noop], rule_out);
 
+        /* // This optimization would be valid for pw.len() > 1,
+           // but i1a is a no-op when pw.len() == 0:
         let rule = vec![Insert{off:0,ch: b'a'}, Swap(0,1)];
         let mut rule_out = vec![];
         minimize_rule(&rule, &mut rule_out);
         assert_eq!(vec![Insert{off:1, ch:b'a'}], rule_out);
+        */
 
         let rule = vec![Lowercase, Lowercase]; let mut rule_out = vec![];
         minimize_rule(&rule, &mut rule_out); assert_eq!(vec![Lowercase], rule_out);
@@ -475,6 +506,24 @@ mod tests {
         let rule = vec![Omit(2,1), Omit(0,1)]; let mut rule_out = vec![];
         minimize_rule(&rule, &mut rule_out);
         assert_eq!(vec![Omit(2,1), Omit(0,1)], rule_out);
+
+        let rule = vec![Insert { off: 0, ch: b'a' }, RotateLeft];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Append(b'a')], rule_out);
+
+        let rule = vec![Append ( b'a'), RotateRight];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Insert{off:0,ch:b'a'}], rule_out);
+
+        let rule = vec![Insert { off: 0, ch: 97 },
+                        RotateLeft,
+                        RotateRight,
+                        Overwrite { off: 0, ch: b'x' }];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Insert{off:0,ch:b'x'}], rule_out);
 
     }
 
@@ -550,14 +599,75 @@ mod tests {
         let rule = parse_rule("i9e D9").unwrap();
         let mut minrule = Vec::new();
         minimize_rule(&rule,&mut minrule);
-        //assert_ne!(minrule, vec![Inst::Noop]);
+        assert_eq!(minrule, vec![Inst::Noop]);
         assert_ne!(rule, vec![Inst::Noop]);
-        //assert_ne!(rule, minrule);
+        assert_ne!(rule, minrule);
         let mut mangled_min = pw.to_vec();
         let mut mangled_big = pw.to_vec();
         evaluate_rule(rule.clone(), &mut mangled_big);
         evaluate_rule(minrule.clone(), &mut mangled_min);
         assert_eq!(mangled_min, mangled_big, "{:?} /// {:?}", minrule, rule);
+    }
+
+    #[test]
+    fn test_minimize_rule_regression_04_insert_swap() {
+        let mut pw = vec![];
+        for _ in 0..=4 {
+            /* Insert{off:0,ch=b'-'}, Swap(0,1)
+             * should not reduce to Noop
+             * because that fails when pw.len() <= 1
+             */
+            let rule = parse_rule("i0-k").unwrap();
+            let mut minrule = Vec::new();
+            minimize_rule(&rule,&mut minrule);
+            assert_ne!(rule, vec![Inst::Noop]);
+            assert_eq!(rule, minrule);
+            let mut mangled_min = pw.to_vec();
+            let mut mangled_big = pw.to_vec();
+            evaluate_rule(rule.clone(), &mut mangled_big);
+            evaluate_rule(minrule.clone(), &mut mangled_min);
+            assert_eq!(mangled_min, mangled_big, "{:?} /// {:?} /// pw:{:?}", minrule, rule, pw);
+            pw.push(b'X');
+        }
+    }
+
+    #[test]
+    fn test_minimize_rule_regression_05_omit0() {
+        let pw = vec![b'A'];
+        let rule = parse_rule("O00").unwrap();
+        let mut minrule = Vec::new();
+        minimize_rule(&rule,&mut minrule);
+        assert_ne!(rule, vec![Inst::Noop]);
+        assert_eq!(minrule, vec![Inst::Noop]);
+        let mut mangled_min = pw.to_vec();
+        let mut mangled_big = pw.to_vec();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        evaluate_rule(minrule.clone(), &mut mangled_min);
+        assert_eq!(mangled_min, mangled_big, "{:?} /// {:?} /// pw:{:?}", minrule, rule, pw);
+    }
+    #[test]
+    fn test_minimize_rule_regression_05_reverse_omit0() {
+        /* O00 is a no-op, so this should minimize to Reverse(r): */
+        let rule = parse_rule("rO00").unwrap();
+        let mut minrule = Vec::new();
+        minimize_rule(&rule,&mut minrule);
+        assert_ne!(rule, vec![Inst::Noop]);
+        assert_eq!(minrule, vec![Inst::Reverse]);
+    }
+
+    #[test]
+    fn test_minimize_rule_regression_05_prepend_omit0() {
+        let pw = vec![b'A'];
+        let rule = parse_rule("^aO00").unwrap();
+        let mut minrule = Vec::new();
+        minimize_rule(&rule,&mut minrule);
+        assert_ne!(rule, vec![Inst::Noop]);
+        assert_eq!(minrule, vec![Inst::Insert{off:0,ch:b'a'}]);
+        let mut mangled_min = pw.to_vec();
+        let mut mangled_big = pw.to_vec();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        evaluate_rule(minrule.clone(), &mut mangled_min);
+        assert_eq!(mangled_min, mangled_big, "{:?} /// {:?} /// pw:{:?}", minrule, rule, pw);
     }
 
     /*
@@ -587,20 +697,22 @@ mod tests {
 
     /*
      * Tests for the Insert instruction, exercising out-of-bounds
-     * insertions (which currently are just turned into appends).
-     * TODO: Check if hashcat ignores these or does the same.
+     * insertions (which should be ignored).
      */
     #[test]
     fn test_evaluate_inst_insert_oob() {
         let mut arr = vec![];
         evaluate_inst(Inst::Insert{off:100,ch:b'B'}, &mut arr);
-        assert_eq!(arr, [b'B']);
-        evaluate_inst(Inst::Insert{off:0,ch:b'A'}, &mut arr);
-        assert_eq!(arr, [b'A',b'B']);
-        evaluate_inst(Inst::Insert{off:1,ch:b'C'}, &mut arr);
-        assert_eq!(arr, [b'A',b'C',b'B']);
-        evaluate_inst(Inst::Insert{off:22,ch:b'D'}, &mut arr);
-        assert_eq!(arr, [b'A',b'C',b'B',b'D']);
+        assert_eq!(arr, []);
+        arr.push(b'A');
+        evaluate_inst(Inst::Insert{off:0,ch:b'B'}, &mut arr);
+        assert_eq!(arr, [b'B',b'A']);
+        evaluate_inst(Inst::Insert{off:2,ch:b'C'}, &mut arr);
+        assert_eq!(arr, [b'B',b'A',b'C']);
+        evaluate_inst(Inst::Insert{off:4,ch:b'C'}, &mut arr);
+        assert_eq!(arr, [b'B',b'A',b'C']);
+        evaluate_inst(Inst::Insert{off:5,ch:b'D'}, &mut arr);
+        assert_eq!(arr, [b'B',b'A',b'C']);
     }
 
     /*
@@ -631,7 +743,20 @@ mod tests {
         assert_eq!(arr, [b'd', b'b', b'A']);
         evaluate_inst(Inst::Omit(0,2), &mut arr);
         assert_eq!(arr, [b'A']);
+        evaluate_inst(Inst::DeleteLastCharacter, &mut arr);
+        assert_eq!(arr, []);
+        evaluate_inst(Inst::Insert{off: 0,ch:b'A'}, &mut arr);
+        assert_eq!(arr, [b'A']);
         evaluate_inst(Inst::Append(b'C'), &mut arr);
+        assert_eq!(arr, [b'A',b'C']);
+        /* Swap(N,M) is a no-op if N,M >= arr.len() */
+        evaluate_inst(Inst::Swap(0,2), &mut arr);
+        assert_eq!(arr, [b'A',b'C']);
+        evaluate_inst(Inst::Swap(2,0), &mut arr);
+        assert_eq!(arr, [b'A',b'C']);
+        evaluate_inst(Inst::Swap(2,1), &mut arr);
+        assert_eq!(arr, [b'A',b'C']);
+        evaluate_inst(Inst::Swap(1,2), &mut arr);
         assert_eq!(arr, [b'A',b'C']);
         evaluate_inst(Inst::Insert{off: 1, ch: b'B'}, &mut arr);
         assert_eq!(arr, [b'A',b'B', b'C']);
