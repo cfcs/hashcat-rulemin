@@ -89,9 +89,7 @@ fn repl() -> rustyline::Result<()> {
                         ]));
                         for word in dict.iter() {
                             let mut mangled = word.as_bytes().to_vec();
-                            for inst in rule.iter() {
-                                rulelib::evaluate_inst(*inst, &mut mangled);
-                            }
+                            rulelib::evaluate_rule(rule, &mut mangled);
                             table.add_row({
                                 let mut r = Row::new(vec![
                                 TableCell::new_with_alignment(word, 2, Alignment::Left),

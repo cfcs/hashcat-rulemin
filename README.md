@@ -39,3 +39,12 @@ It looks like this:
 │ testWord123                                     │                                     estword123CB │
 │ MyoTHERward                                     │                                     yotherwardCB │
 ```
+
+### Fuzzing
+
+```shell
+# may need: cargo install cargo-fuzz
+cd rulelib
+cargo fuzz build
+cargo fuzz run fuzz_target_1
+```

@@ -48,9 +48,43 @@ pub fn minimize_rule(input: &Vec<Inst>, output: &mut Vec<Inst>) {
              */
             match (e, workvec.get(idx+1).copied()) {
                 (Noop, _) => { skipping=Some(idx) }
+                (Omit(_,0), _) => { skipping=Some(idx) }
+                (Swap(a1,a2),_ ) if a1 == a2 => { skipping=Some(idx) }
+                /* Reversing twice is a no-op: */
+                (Reverse, Some(Reverse)) => { skipping = Some(idx+1) }
+                /* Swapping twice is a no-op: */
+                (SwapBack, Some(SwapBack)) => { skipping = Some(idx+1) }
+                (Swap(a1,a2), Some(Swap(b1,b2))) if (
+                    std::cmp::min(a1,a2) == std::cmp::min(b1,b2)
+                        && std::cmp::max(a1,a2) == std::cmp::max(b1,b2)
+                ) => { skipping = Some(idx+1) }
+                /* Append, RotateRight, Omit(0,1) is noop */
+                /* Append(Z), RotateRight => Insert(0,Z) */
+
+                /* insert_omit_noop
+                 * Insert(0,Z), Omit(0) => Noop*/
+                (Insert{off,ch:_}, Some(Omit(opos, olen))) if (
+                    false && /* */
+                    (opos == off)) => {
+                    // it's definitely going away
+                    if olen == 1 { // becomes 0 after decrementing
+                        output.push(Noop);
+                    } else {
+                        // opos +1 (insert pos) -1 (inserted value)== opos
+                        output.push(Omit(opos, olen-1));
+                    }
+                    skipping = Some(idx+1);
+                }
+                /* Insert{off=0,ch}, Some(Swap(0,1)) => Insert(x,ch) */
+                (Insert{off: 0,ch}, Some(Swap(0,1))) => {
+                    /* should be a more generalizable */
+                    skipping = Some(idx+1);
+                    output.push(Insert{off: 1, ch});
+                }
                 /* Rotating forth and back is a no-op: */
                 (RotateRight, Some(RotateLeft)) => { skipping = Some(idx+1) }
                 (RotateLeft, Some(RotateRight)) => { skipping = Some(idx+1) }
+                /* i0a i0b D1 => i0b */
                 /* Collapse Uppercase/Lowercase (one is enough): */
                 (Uppercase, Some(Uppercase)) => { output.push(e);
                                                   skipping = Some(idx+1) }
@@ -61,7 +95,10 @@ pub fn minimize_rule(input: &Vec<Inst>, output: &mut Vec<Inst>) {
                 (Lowercase, Some(Uppercase)) => {
                     skipping=Some(idx); /* don't push Lowercase */ }
                 /* Collapse overlapping delete/omit: */
-                (Omit(pos1, o1), Some(Omit(pos2,o2))) if pos1 == pos2 => {
+                (Omit(pos1, o1), Some(Omit(pos2,o2))) if (
+                    pos1 == pos2
+                        && (o1 + o2 < 35) /* test_minimize_rule_regression_01_omit_unrepresentable */
+                ) => {
                     output.push(Omit(pos1, o1+o2));
                     skipping = Some(idx+1);
                 }
@@ -166,6 +203,12 @@ pub fn evaluate_inst(inst: Inst, input: &mut Vec<u8>) {
     }
 }
 
+pub fn evaluate_rule(rule: Vec<Inst>, mangled: &mut Vec<u8>) {
+    for &inst in rule.iter() {
+        evaluate_inst(inst, mangled);
+    }
+}
+
 use nom::{
     Parser,
     IResult,
@@ -217,6 +260,13 @@ fn parse_offset(i: &str) -> IResult<&str, u8, VerboseError<&str>> {
     ).parse(i)
 }
 
+/*
+ * TODO: note that 'anychar' should accept
+ * backslash-escaped hex too:
+ */
+fn hashcat_char(i: &str) -> IResult<&str, u8, VerboseError<&str>> {
+    nom::character::complete::anychar.map(|ch| ch as u8).parse(i)
+}
 
 /*
  * Parse arity/1 instructions.
@@ -227,11 +277,8 @@ fn parse_inst1(i: &str) -> IResult<&str, Inst, VerboseError<&str>> {
         "inst/1",
         alt((
             preceded(char('D'), parse_offset).map(|off| Inst::Omit(off,1)),
-            /*
-             * TODO: note that 'anychar' should accept
-             * backslash-escaped hex too:
-             */
-            preceded(char('$'), nom::character::complete::anychar).map(|ch| Append(ch as u8)),
+            preceded(char('$'), hashcat_char).map(|ch| Append(ch)),
+            preceded(char('^'), hashcat_char).map(|ch| Insert{off:0,ch}),
         )))(i)
 }
 
@@ -243,9 +290,9 @@ fn parse_inst2(i: &str) -> IResult<&str, Inst, VerboseError<&str>> {
     context(
         "inst/2",
         alt((
-            // TODO: missing: Insert
             preceded(char('*'), parse_offset.and(parse_offset)).map(|(n,m)| Swap(n,m)),
             preceded(char('O'), parse_offset.and(parse_offset)).map(|(n,m)| Omit(n,m)),
+            preceded(char('i'), parse_offset.and(hashcat_char)).map(|(n,m)| Insert{off:n,ch:m}),
         )))(i)
 }
 
@@ -312,6 +359,9 @@ mod tests {
         let rule = vec![Lowercase]; let mut rule_out = vec![];
         minimize_rule(&rule, &mut rule_out); assert_eq!(rule, rule_out);
 
+        let rule = vec![Reverse]; let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out); assert_eq!(rule, rule_out);
+
     }
     #[test]
 
@@ -331,6 +381,20 @@ mod tests {
 
         let rule = vec![Lowercase, Uppercase]; let mut rule_out = vec![];
         minimize_rule(&rule, &mut rule_out); assert_eq!(vec![Uppercase], rule_out);
+
+        let rule = vec![SwapBack,SwapBack]; let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out); assert_eq!(vec![Noop], rule_out);
+
+        let rule = vec![Swap(1,4),Swap(4,1)]; let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out); assert_eq!(vec![Noop], rule_out);
+
+        let rule = vec![Reverse,Reverse]; let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out); assert_eq!(vec![Noop], rule_out);
+
+        let rule = vec![Insert{off:0,ch: b'a'}, Swap(0,1)];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Insert{off:1, ch:b'a'}], rule_out);
 
         let rule = vec![Lowercase, Lowercase]; let mut rule_out = vec![];
         minimize_rule(&rule, &mut rule_out); assert_eq!(vec![Lowercase], rule_out);
@@ -401,6 +465,51 @@ mod tests {
         assert_eq!(parse_rule(" : : "), Ok(vec![Inst::Noop, Inst::Noop]));
         assert_eq!(parse_rule(" : \t : "), Ok(vec![Inst::Noop, Inst::Noop]));
         assert_eq!(parse_rule(":\t"), Ok(vec![Inst::Noop]));
+    }
+
+    #[test]
+    fn test_minimize_rule_regression_01_omit_unrepresentable() {
+        let rule = parse_rule("OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO").unwrap();
+        let mut buf = Vec::new();
+        minimize_rule(&rule,&mut buf);
+    }
+
+    #[test]
+    fn test_minimize_rule_regression_02_insert_swap_omit() {
+        let pw = [b'a',b'b',b'c'];
+        let rule = parse_rule("i0a *01 D0").unwrap();
+        let mut minrule = Vec::new();
+        minimize_rule(&rule,&mut minrule);
+        assert_ne!(minrule, vec![Inst::Noop]);
+        let mut mangled_min = pw.to_vec();
+        let mut mangled_big = pw.to_vec();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        evaluate_rule(minrule.clone(), &mut mangled_min);
+        assert_eq!(mangled_min, mangled_big, "{:?} /// {:?}", minrule, rule);
+    }
+
+    /*
+     * While the optimization iX DX => : looks good,
+     * it only works if iX succeeds (if the candidate word
+     * is already large enough).
+     * Our current implementation appends to the end, but
+     * it remains to be tested how hashcat reacts.
+     * if hashcat ignores OOB inserts, we can turn this back on.
+     */
+    #[test]
+    fn test_minimize_rule_regression_03_insert_omit_noop() {
+        let pw = [b'a',b'b',b'c'];
+        let rule = parse_rule("i9e D9").unwrap();
+        let mut minrule = Vec::new();
+        minimize_rule(&rule,&mut minrule);
+        //assert_ne!(minrule, vec![Inst::Noop]);
+        assert_ne!(rule, vec![Inst::Noop]);
+        //assert_ne!(rule, minrule);
+        let mut mangled_min = pw.to_vec();
+        let mut mangled_big = pw.to_vec();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        evaluate_rule(minrule.clone(), &mut mangled_min);
+        assert_eq!(mangled_min, mangled_big, "{:?} /// {:?}", minrule, rule);
     }
 
     /*
@@ -485,6 +594,12 @@ mod tests {
         evaluate_inst(Inst::SwapBack, &mut arr);
         assert_eq!(arr, [b'A',b'B',b'C', b'3']);
         evaluate_inst(Inst::Swap(0,2), &mut arr);
+        assert_eq!(arr, [b'C',b'B',b'A', b'3']);
+        evaluate_inst(Inst::Insert{off:1, ch:b'1'}, &mut arr);
+        assert_eq!(arr, [b'C',b'1',b'B',b'A', b'3']);
+        evaluate_inst(Inst::Insert{off:1, ch:b'2'}, &mut arr);
+        assert_eq!(arr, [b'C',b'2',b'1',b'B',b'A', b'3']);
+        evaluate_inst(Inst::Omit(1,2), &mut arr);
         assert_eq!(arr, [b'C',b'B',b'A', b'3']);
     }
 }
