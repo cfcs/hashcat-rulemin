@@ -14,6 +14,7 @@ pub enum Inst {
     Lowercase,
     Uppercase,
     Reverse,
+    Duplicate(u8), // Duplicate(N) repeats the whole candidate N times
     RotateLeft,
     RotateRight,
     DeleteLastCharacter,
@@ -41,6 +42,7 @@ impl ToString for Inst {
             Lowercase   => {String::from("l")}
             Uppercase   => {String::from("u")}
             Reverse     => {String::from("r")}
+            Duplicate(n)=> {format!("p{}", unparse_offset(*n))}
             RotateLeft  => {String::from("{")}
             RotateRight => {String::from("}")}
             DeleteLastCharacter => {String::from("]")}
@@ -72,6 +74,20 @@ impl ToString for Inst {
 pub fn minimize_rule(input: &Vec<Inst>, output: &mut Vec<Inst>) {
     use crate::Inst::*;
 
+    for inst in input.iter() {
+        if let Duplicate(n) = inst {
+            if *n != 0 {
+                /* Don't optimize rules that contain Duplicate(n>0);
+                 * the candidate quickly grows to the maximum size
+                 * and then a lot of the transformations break down
+                 * because ex. Append becomes a no-op.
+                 */
+                output.extend(input);
+                return;
+            }
+        }
+    }
+
     output.truncate(0);
     let workvec : &mut Vec<Inst> = &mut input.clone();
 
@@ -98,6 +114,10 @@ pub fn minimize_rule(input: &Vec<Inst>, output: &mut Vec<Inst>) {
                     std::cmp::min(a1,a2) == std::cmp::min(b1,b2)
                         && std::cmp::max(a1,a2) == std::cmp::max(b1,b2)
                 ) => { skipping = Some(idx+1) }
+                /* p0 is a no-op: */
+                (Duplicate(0), _) => {
+                    skipping = Some(idx)
+                }
                 /* Append, RotateRight, Omit(0,1) is noop */
                 /* Append(Z), RotateRight => Insert(0,Z) */
                 (Append(ch), Some(RotateRight)) => {
@@ -242,24 +262,25 @@ pub fn minimize_rule(input: &Vec<Inst>, output: &mut Vec<Inst>) {
  * In line with hashcat, invalid instructions are silently
  * ignored (but I haven't validated that the behaviour is
  * identical).
+ * Also do note that we aim for a maximum candidate length of 255
+ * bytes. Hashcat will do somewhere between 32 and 255, depending on
+ * which backend is used.
  */
 pub fn evaluate_inst(inst: Inst, input: &mut Vec<u8>) {
     use crate::Inst::*;
     match inst {
         Noop => {},
-        Lowercase => {
-            input.make_ascii_lowercase();
-            /* well that was certainly easier than
-            for ch in input.iter_mut() {
-                if 'A' as u8 <= *ch && *ch <= 'Z' as u8 {
-                    *ch = *ch + 0x20;
-                }
-            }*/
-        },
+        Lowercase => { input.make_ascii_lowercase(); }
         Uppercase => { input.make_ascii_uppercase(); }
         RotateLeft => { if input.len() > 1 { input.rotate_left(1); } }
         RotateRight => { if input.len() > 1 { input.rotate_right(1); } }
         Reverse => { input.reverse(); }
+        Duplicate(n) => {
+            let n = n as usize;
+            if input.len() * n < 256 {
+                input.extend(input.repeat(n))
+            }
+        }
         DeleteLastCharacter => {
             if input.len() > 0 {
                 input.truncate(input.len()-1);
@@ -294,10 +315,10 @@ pub fn evaluate_inst(inst: Inst, input: &mut Vec<u8>) {
                 input.swap(len-1, len-2);
             }
         },
-        Append(ch) => { input.push(ch); }
+        Append(ch) => { if input.len() < 255 { input.push(ch); } }
         Insert{off,ch} => {
             /* ignored when OOB: */
-            if (off as usize) <= input.len() {
+            if (off as usize) <= input.len() && input.len() < 255 {
                 input.splice(off as usize .. off as usize, [ch]);
             }
         }
@@ -345,7 +366,7 @@ use nom::{
  * Parse arity/0 instructions.
  */
 fn parse_inst0(i: &str) -> IResult<&str, Inst, VerboseError<&str>> {
-    let (i, t) = context("inst/0", one_of(":lur}{][kK"))(i)?;
+    let (i, t) = context("inst/0", one_of(":lurd}{][kK"))(i)?;
     use crate::Inst::*;
     Ok((i,
         match t {
@@ -353,6 +374,7 @@ fn parse_inst0(i: &str) -> IResult<&str, Inst, VerboseError<&str>> {
             'l' => { Inst::Lowercase },   // p@ssW0rd -> p@ssw0rd
             'u' => { Inst::Uppercase },   // p@ssW0rd -> P@SSW0RD
             'r' => { Inst::Reverse },     // p@ssW0rd -> dr0Wss@p
+            'd' => { Inst::Duplicate(1) },// p@ssW0rd -> p@ssW0rdp@ssW0rd
             '{' => { Inst::RotateLeft },  // p@ssW0rd -> @ssW0rdp
             '}' => { Inst::RotateRight }, // p@ssW0rd -> dp@ssW0r
             '[' => { Inst::Omit(0,1) },   // p@ssW0rd -> @ssW0rd
@@ -402,6 +424,7 @@ fn parse_inst1(i: &str) -> IResult<&str, Inst, VerboseError<&str>> {
         "inst/1",
         alt((
             preceded(char('D'), parse_offset).map(|off| Inst::Omit(off,1)),
+            preceded(char('p'), parse_offset).map(|n| Inst::Duplicate(n)),
             preceded(char('@'), hashcat_char).map(|ch| Purge(ch)),
             preceded(char('$'), hashcat_char).map(|ch| Append(ch)),
             preceded(char('^'), hashcat_char).map(|ch| Insert{off:0,ch}),
@@ -621,6 +644,9 @@ mod tests {
         assert_eq!(parse_inst("l"), Ok(("", Inst::Lowercase)));
         assert_eq!(parse_inst("u"), Ok(("", Inst::Uppercase)));
         assert_eq!(parse_inst("r"), Ok(("", Inst::Reverse)));
+        assert_eq!(parse_inst("d"), Ok(("", Inst::Duplicate(1))));
+        assert_eq!(parse_inst("p1"), Ok(("", Inst::Duplicate(1))));
+        assert_eq!(parse_inst("p2"), Ok(("", Inst::Duplicate(2))));
         assert_eq!(parse_inst("{"), Ok(("", Inst::RotateLeft)));
         assert_eq!(parse_inst("}"), Ok(("", Inst::RotateRight)));
         assert_eq!(parse_inst("k"), Ok(("", Inst::Swap(0,1))));
@@ -934,7 +960,11 @@ mod tests {
         assert_eq!(arr, [b'A',b'c',b'd']);
         evaluate_inst(Inst::Extract(1,10), &mut arr);
         assert_eq!(arr, [b'c',b'd']);
+        evaluate_inst(Inst::Duplicate(0), &mut arr);
+        assert_eq!(arr, [b'c',b'd']);
+        evaluate_inst(Inst::Duplicate(1), &mut arr);
+        assert_eq!(arr, [b'c',b'd',b'c',b'd']);
         evaluate_inst(Inst::Purge(b'd'), &mut arr);
-        assert_eq!(arr, [b'c']);
+        assert_eq!(arr, [b'c',b'c']);
     }
 }

@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rulelib::{ minimize_rule, evaluate_inst, parse_rule };
+use rulelib::{ Inst, minimize_rule, evaluate_inst, parse_rule };
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 2 { return; }
