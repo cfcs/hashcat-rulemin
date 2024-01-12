@@ -68,6 +68,26 @@ impl ToString for Inst {
 }
 
 /*
+ * Normalize/canonicalize an individual instruction,
+ * potentially modifying the operands (but not the Inst constructor itself).
+ */
+pub fn normalize_inst(input: &mut Inst) {
+    use crate::Inst::*;
+    match input {
+        Swap(a,b) if (*a > *b) => { *input = Swap(*b,*a) }
+        _ => { }
+    }
+}
+
+/*
+ * Canonicalize the rule, changing operands without changing the instructions
+ * themselves.
+ */
+pub fn normalize_rule(input: &mut Vec<Inst>) {
+    input.iter_mut().for_each(normalize_inst);
+}
+
+/*
  * Recursively attempt to collapse a vector of instruction to a smaller
  * (but equivalent) vector.
  */
@@ -92,6 +112,11 @@ pub fn minimize_rule(input: &Vec<Inst>, output: &mut Vec<Inst>) {
     let workvec : &mut Vec<Inst> = &mut input.clone();
 
     loop {
+        /*
+         * For each pass we also normalize the output:
+         */
+        normalize_rule(workvec);
+
         let mut skipping = None;
         for (idx, &e) in workvec.iter().enumerate() {
             if let Some(skip_idx) = skipping {
@@ -108,6 +133,74 @@ pub fn minimize_rule(input: &Vec<Inst>, output: &mut Vec<Inst>) {
                 (Swap(a1,a2),_ ) if a1 == a2 => { skipping=Some(idx) }
                 /* Reversing twice is a no-op: */
                 (Reverse, Some(Reverse)) => { skipping = Some(idx+1) }
+
+                // TODO (Extract(), Some(Omit()))
+
+                /*
+                 * Anything preceding Extract(0,0) is a no-op
+                 * TODO only because we don't implement the memory 'M' inst
+                 * (but it still clears the buffer):*/
+                (_, Some(Extract(0,0))) => {
+                    output.clear();
+                    output.push(Extract(0,0));
+                    skipping = Some(idx+1);
+                }
+                /* The smaller of the two should do: */
+                (Extract(n1,0), Some(Extract(n2,0))) => {
+                    output.push(Extract(std::cmp::min(n1,n2),0));
+                    skipping = Some(idx+1);
+                }
+                /*
+                 * Extracting n1<=n2, n1 can't be OOB without n2 being OOB too,
+                 * therefore n2 operates on an empty string:
+                 */
+                (Extract(n1,0), Some(Extract(0,m2))) if (n1 == m2) => {
+                    output.push(Extract(n1,0));
+                    skipping = Some(idx+1)
+                }
+                /* when m1 >= m2, 0..m2 is narrower than 0..m1; so skip m1: */
+                /*
+                (Extract(0,m1), Some(Extract(0,m2))) if (m1 >= m2) => {
+                    output.push(Extract(0,m2));
+                    skipping = Some(idx+1)
+                }*/
+                /* x03 x20 */
+                (Extract(0,m1), Some(Extract(n2,m2))) if (n2 < m1 && m1 >= n2+ m2) => {
+                    output.push(Extract(n2,m2));
+                    skipping = Some(idx+1)
+                }
+                /*
+                 * Here we know that B can't succeed if A succeeds,
+                 * so we reduce to A. The cases are:
+                 * 1) Both are OOB (depends on candidate)
+                 * 2) Both work    (depends on candidate)
+                 * 2) A is OOB, B works { n1>n2 || n1+m1 > n2+m2 }
+                 * 3) A works, B is OOB { n1<n2 || n1+m1 < n2+m2 }
+                 * 3.1) since B selects inside n1..m1 iff A: { A /\ m1 < n2+m2 }
+                 * We are concerned with eliminating B in case 3:
+                 * x)     n1 <= n2: if B's pos is ok, so is A's
+                 * y)  && m1 <= m2: (m2-n2) < (m1-n1) (by x)
+                 */
+                // n1=3,m1=2 n2=2,m2=3
+                (Extract(n1,m1), Some(Extract(n2,m2))) if (
+                    n1 <= n2 && m1 <= m2) => {
+                    output.push(Extract(n1,m1));
+                    skipping = Some(idx+1);
+                }
+                (Extract(n1,m1), Some(Extract(n2,m2))) if (n1+m1 == n2+m2 && m1 != 0) => {
+                    output.push(Extract(n1,m1));
+                    skipping = Some(idx+1);
+                }
+                (Extract(n1,m1), Some(Extract(n2,m2))) if (
+                    m1 != 0 &&
+                    (
+                        (n1+m1 < n2+m2) || (n1+m1 == n2+m2)
+                    )
+                ) => {
+                    output.push(Extract(n1,m1));
+                    skipping = Some(idx+1);
+                }
+
                 /* Swapping twice is a no-op: */
                 (SwapBack, Some(SwapBack)) => { skipping = Some(idx+1) }
                 (Swap(a1,a2), Some(Swap(b1,b2))) if (
@@ -239,6 +332,13 @@ pub fn minimize_rule(input: &Vec<Inst>, output: &mut Vec<Inst>) {
                 assert!(input.len() > output.len());
                 // this pass made it smaller (we made progres):
                 assert!(workvec.len() > output.len());
+                /*
+                 * NB: If the above invariant is relaxed, workvec should be
+                 * normalized again. Currently we normalize before rewriting,
+                 * because we always trigger another pass if rewriting takes
+                 * place.
+                 */
+
                 workvec.truncate(0);
                 for &inst in output.iter() {
                     workvec.push(inst);
@@ -288,10 +388,10 @@ pub fn evaluate_inst(inst: Inst, input: &mut Vec<u8>) {
         }
         Extract(pos,amount) => {
             let pos = pos as usize;
-            if pos < input.len() { // x is no-op when pos >= len
-                let extracted = input[
-                    (pos as usize)..std::cmp::min(pos+amount as usize, input.len())
-                ].to_vec();
+            let amount = amount as usize;
+            /* x is no-op when pos >= len || pos + amount >= input.len: */
+            if pos < input.len() && pos + (amount as usize) <= input.len() {
+                let extracted = input[pos..pos+amount].to_vec();
                 input.clear();
                 input.extend(extracted);
             }
@@ -342,6 +442,11 @@ pub fn evaluate_inst(inst: Inst, input: &mut Vec<u8>) {
 }
 
 pub fn evaluate_rule(rule: Vec<Inst>, mangled: &mut Vec<u8>) {
+    if 0 == rule.len() {
+        /* hashcat ignore rules without at least a Noop.*/
+        mangled.clear();
+        return;
+    }
     for &inst in rule.iter() {
         evaluate_inst(inst, mangled);
     }
@@ -636,6 +741,94 @@ mod tests {
         minimize_rule(&rule, &mut rule_out);
         assert_eq!(vec![Purge(b'a')], rule_out);
 
+        let rule = vec![Extract(0,0),Extract(0,1)];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Extract(0,0)], rule_out);
+
+        let rule = vec![Extract(2,0),Extract(3,1)];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Extract(2,0)], rule_out);
+
+        let rule = vec![Extract(2,0),Extract(2,0)];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Extract(2,0)], rule_out);
+
+        // if x2A succeeds, x330 can't
+        // if x2A fails, x330 can't succeed
+        let rule = vec![Extract(2,10),Extract(3,30)];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Extract(2,10)], rule_out);
+
+        // we can statically calculate that the second x33 will be a no-op
+        // because it's out of bounds (0..=2 vs 3..6):
+        let rule = vec![Extract(3,4),Extract(3,3)];
+        let mut rule_out = vec![]; minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Extract(3,4),Extract(3,3)], rule_out);
+
+        let rule = vec![Extract(3,2),Extract(3,3)];
+        let mut rule_out = vec![]; minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Extract(3,2)], rule_out);
+
+        let rule = vec![Extract(3,3),Extract(3,4)];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Extract(3,3)], rule_out);
+
+        let rule = vec![Extract(3,4),Extract(3,3)];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Extract(3,4),Extract(3,3)], rule_out);
+
+        let rule = vec![Extract(3,2),Extract(2,3)];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Extract(3,2)], rule_out);
+    }
+    #[test]
+    fn test_minimize_rule_x03_x20_x02() {
+        /* This one is a bit dirty; there's an optimization
+         * but it depends on Extract(2,0) being a noop for candidates length 1,2
+         */
+        // with candidates of length 3, x20 fails, but x02 works (but is noop):
+        // 0: all fail (result is empty, a noop)
+        // 1: all fail (result is untouched)
+        // 2: x03 fails, x20 fails, x02 works (but is a no-op)
+        //>2: x03 works, x20 works,, x02 is OOB (result is empty)
+        use crate::Inst::*;
+        let rule = vec![Extract(2,0),Extract(0,2)];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Extract(2,0)], rule_out);
+
+        let rule = vec![Extract(0,3),Extract(2,0),Extract(0,2)];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Extract(2,0)], rule_out);
+    }
+
+    #[test]
+    fn test_minimize_rule_2() {
+        use crate::Inst::*;
+
+        /* x20 x11 cannot be reduced because x20 is OOB for
+         * candidate sizes 1 and 2
+         */
+        let rule = vec![Extract(2, 0), Extract(1, 1)];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Extract(2,0), Extract(1,1)], rule_out);
+
+        // 6: echo '0123456' | hashcat --stdout -j 'x34 x31'
+        // 3: echo '012345' | hashcat --stdout -j 'x34 x31'
+        // when x34 fails, x31 can still succeed on a str of length 6 (< 4+3)
+        let rule = vec![Extract(3,4),Extract(3,1)];
+        let mut rule_out = vec![];
+        minimize_rule(&rule, &mut rule_out);
+        assert_eq!(vec![Extract(3,4), Extract(3,1)], rule_out);
     }
 
     #[test]
@@ -805,16 +998,19 @@ mod tests {
         evaluate_rule(rule.clone(), &mut mangled_big);
         assert_eq!(vec![b'A',b'B',b'C'], mangled_big,
                    "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
-        let rule = parse_rule("x30").unwrap();
+
+        let rule = parse_rule("x03").unwrap();
         let mut mangled_big = pw.to_vec();
         evaluate_rule(rule.clone(), &mut mangled_big);
         assert_eq!(vec![b'A',b'B',b'C'], mangled_big,
                    "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+
         let rule = parse_rule("x21").unwrap();
         let mut mangled_big = pw.to_vec();
         evaluate_rule(rule.clone(), &mut mangled_big);
         assert_eq!(vec![b'C'], mangled_big,
                    "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+
         /* entire range (overshooting): */
         let rule = parse_rule("x0K").unwrap();
         let mut mangled_big = pw.to_vec();
@@ -841,6 +1037,162 @@ mod tests {
         evaluate_rule(rule.clone(), &mut mangled_big);
         assert_eq!(mangled_big, vec![],
                    "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+
+        /*
+         * echo '0123456789' | hashcat --stdout -j 'x17 : x37'
+         * x17 succeeds, x37 is ignored because it's out of bounds.
+         */
+        let rule = parse_rule("x17 : x37").unwrap();
+        let mut minrule = vec![];
+        minimize_rule(&rule, &mut minrule);
+        let mut mangled_big = vec![0, 1,2,3,4,5,6,7,8,9];
+        let mut mangled_small = mangled_big.clone();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        assert_ne!(mangled_big, mangled_small);
+        evaluate_rule(minrule.clone(), &mut mangled_small);
+        assert_eq!(mangled_big, vec![1,2,3,4,5,6,7],
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+        assert_eq!(mangled_small, mangled_big,
+                   "{:?} -> {:?}", minrule, mangled_small);
+
+        /*
+         * this turns into x33 because the second x33 is a no-op
+         * since it's out of range:
+         */
+        let rule = parse_rule("x33 : x33").unwrap();
+        let mut minrule = vec![];
+        minimize_rule(&rule, &mut minrule);
+        let mut mangled_big = vec![0, 1,2,3,4,5,6,7,8,9];
+        let mut mangled_small = mangled_big.clone();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        assert_ne!(mangled_big, mangled_small);
+        evaluate_rule(minrule.clone(), &mut mangled_small);
+        assert_eq!(mangled_big, vec![3,4,5],
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+        assert_eq!(mangled_small, mangled_big,
+                   "{:?} -> {:?}", minrule, mangled_small);
+
+        // both succeed, x31 selects x61:
+        let rule = parse_rule("x34 x31").unwrap();
+        let mut minrule = vec![];
+        minimize_rule(&rule, &mut minrule);
+        let mut mangled_big = vec![0, 1,2,3,4,5,6];
+        let mut mangled_small = mangled_big.clone();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        assert_ne!(mangled_big, mangled_small);
+        evaluate_rule(minrule.clone(), &mut mangled_small);
+        assert_eq!(mangled_big, vec![6],
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+        assert_eq!(mangled_small, mangled_big,
+                   "{:?} -> {:?}", minrule, mangled_small);
+
+        // x34 fails, second x31 succeeds
+        let rule = parse_rule("x34 x31").unwrap();
+        let mut minrule = vec![];
+        minimize_rule(&rule, &mut minrule);
+        let mut mangled_big = vec![0, 1,2,3,4,5,];
+        let mut mangled_small = mangled_big.clone();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        assert_ne!(mangled_big, mangled_small);
+        evaluate_rule(minrule.clone(), &mut mangled_small);
+        assert_eq!(mangled_big, vec![3],
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+        assert_eq!(mangled_small, mangled_big,
+                   "{:?} -> {:?}", minrule, mangled_small);
+
+        // SELECTS NOTHING: x34 fails, x31 fails
+        let rule = parse_rule("x34 x31").unwrap();
+        let mut minrule = vec![];
+        minimize_rule(&rule, &mut minrule);
+        let mut mangled_big = vec![0, 1,2,];
+        let mut mangled_small = mangled_big.clone();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        assert_eq!(mangled_big, mangled_small); // shouldn't have changed
+        evaluate_rule(minrule.clone(), &mut mangled_small);
+        assert_eq!(mangled_big, vec![0,1,2],
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+        assert_eq!(mangled_small, mangled_big,
+                   "{:?} -> {:?}", minrule, mangled_small);
+
+        // SELECTS NOTHING: x34 fails, x33 succeeds:
+        let rule = parse_rule("x34 x33").unwrap();
+        let mut minrule = vec![];
+        minimize_rule(&rule, &mut minrule);
+        let mut mangled_big = vec![0, 1,2,3,4,5];
+        let mut mangled_small = mangled_big.clone();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        assert_ne!(mangled_big, mangled_small);
+        evaluate_rule(minrule.clone(), &mut mangled_small);
+        assert_eq!(mangled_big, vec![3,4,5],
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+        assert_eq!(mangled_small, mangled_big,
+                   "{:?} -> {:?}", minrule, mangled_small);
+
+        let rule = parse_rule("x03 x20").unwrap();
+        let mut minrule = vec![];
+        minimize_rule(&rule, &mut minrule);
+        let mut mangled_big = vec![0];
+        let mut mangled_small = mangled_big.clone();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        assert_eq!(mangled_big, mangled_small); // big should be a noop
+        evaluate_rule(minrule.clone(), &mut mangled_small);
+        assert_eq!(mangled_big, vec![0],
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+        assert_eq!(mangled_small, mangled_big,
+                   "{:?} -> {:?}", minrule, mangled_small);
+
+        let rule = parse_rule("x03 x30").unwrap();
+        let mut minrule = vec![];
+        minimize_rule(&rule, &mut minrule);
+        let mut mangled_big = vec![0,1,2];
+        let mut mangled_small = mangled_big.clone();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        evaluate_rule(minrule.clone(), &mut mangled_small);
+        assert_eq!(mangled_big, vec![0,1,2],
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+        assert_eq!(mangled_small, mangled_big,
+                   "{:?} -> {:?}", minrule, mangled_small);
+
+        let rule = parse_rule("x03 x30").unwrap();
+        let mut minrule = vec![];
+        minimize_rule(&rule, &mut minrule);
+        let mut mangled_big = vec![0,1,2,3];
+        let mut mangled_small = mangled_big.clone();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        evaluate_rule(minrule.clone(), &mut mangled_small);
+        assert_eq!(mangled_big, vec![0,1,2],
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+        assert_eq!(mangled_small, mangled_big,
+                   "{:?} -> {:?}", minrule, mangled_small);
+
+        // x20 is OOB:
+        let rule = parse_rule("x20 x11").unwrap();
+        let mut minrule = vec![];
+        minimize_rule(&rule, &mut minrule);
+        let mut mangled_big = vec![0,1];
+        let mut mangled_small = mangled_big.clone();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        evaluate_rule(minrule.clone(), &mut mangled_small);
+        assert_eq!(mangled_big, vec![1],
+                   "{:?} /// {:?} /// pw:{:?}", rule, mangled_big, pw);
+        assert_eq!(mangled_small, mangled_big,
+                   "{:?} -> {:?}", minrule, mangled_small);
+    }
+
+    #[test]
+    fn test_minimize_rule_regression_07_extract_oob_index_x20_x11() {
+        // x20 is OOB, x11 is not:
+        let rule = parse_rule("x20 x11").unwrap();
+        let mut minrule = vec![];
+        minimize_rule(&rule, &mut minrule);
+        let mut mangled_big = vec![0,1];
+        let mut mangled_small = mangled_big.clone();
+        evaluate_rule(rule.clone(), &mut mangled_big);
+        evaluate_rule(minrule.clone(), &mut mangled_small);
+        assert_eq!(mangled_big, vec![1],
+                   "{:?} /// {:?}", rule, mangled_big);
+        assert_eq!(mangled_small, mangled_big,
+                   "{:?} -> {:?}", minrule, mangled_small);
     }
 
     /*
@@ -956,12 +1308,20 @@ mod tests {
         evaluate_inst(Inst::Append(b'c'), &mut arr);
         evaluate_inst(Inst::Append(b'd'), &mut arr);
         assert_eq!(arr, [b'B',b'A',b'c',b'd']);
+
+        // echo 'BAcd' | hashcat --stdout -j 'x13'
         evaluate_inst(Inst::Extract(1,3), &mut arr);
         assert_eq!(arr, [b'A',b'c',b'd']);
-        evaluate_inst(Inst::Extract(1,10), &mut arr);
+
+        evaluate_inst(Inst::Extract(1,2), &mut arr);
         assert_eq!(arr, [b'c',b'd']);
+
         evaluate_inst(Inst::Duplicate(0), &mut arr);
         assert_eq!(arr, [b'c',b'd']);
+        evaluate_inst(Inst::Duplicate(2), &mut arr);
+        assert_eq!(arr, [b'c',b'd',b'c',b'd',b'c',b'd']);
+        evaluate_inst(Inst::Extract(2,2), &mut arr);
+        assert_eq!(arr, [b'c',b'd',]);
         evaluate_inst(Inst::Duplicate(1), &mut arr);
         assert_eq!(arr, [b'c',b'd',b'c',b'd']);
         evaluate_inst(Inst::Purge(b'd'), &mut arr);

@@ -107,7 +107,10 @@ fn repl() -> rustyline::Result<()> {
                          */
                         for word in dict.iter() {
                             let mut mangled = word.as_bytes().to_vec();
+                            let mut mangled_optim = mangled.clone();
                             rulelib::evaluate_rule(rule.clone(), &mut mangled);
+                            rulelib::evaluate_rule(
+                                optimized.clone(), &mut mangled_optim);
                             table.add_row({
                                 let mut r = Row::new(vec![
                                     /* Original: */
@@ -115,6 +118,9 @@ fn repl() -> rustyline::Result<()> {
                                     /* After applying rule: */
                                     TableCell::new_with_alignment(
                                         String::from_utf8(mangled).unwrap(),
+                                        2, Alignment::Right),
+                                    TableCell::new_with_alignment(
+                                        String::from_utf8(mangled_optim).unwrap(),
                                         2, Alignment::Right),
                                 ]);
                                 r.has_separator = false;
