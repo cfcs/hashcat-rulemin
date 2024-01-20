@@ -30,6 +30,8 @@ pub enum Inst {
     Overwrite{off: u8, ch: u8}, // overwrite ch at off
     Purge(u8), // Purge(ch): delete all ch - '@x' Purge(b'x') deletes all 'x'
     Replace(u8,u8), // Replace(S,R) replaces all S with R 'sSR'
+    ReplaceWithNext(u8), // Replace character @ N with value at @ N plus 1
+    ReplaceWithFormer(u8), //  Replace character @ N with value at @ N minus 1
 }
 
 impl ToString for Inst {
@@ -63,6 +65,8 @@ impl ToString for Inst {
             Purge(ch) => {format!("@{}", *ch as char)}
             Replace(ch_s,ch_r) => {
                 format!("s{}{}", *ch_s as char, *ch_r as char)}
+            ReplaceWithNext(off) => { format!(".{}", unparse_offset(*off)) }
+            ReplaceWithFormer(off) => { format!(",{}", unparse_offset(*off)) }
         }
     }
 }
@@ -330,7 +334,7 @@ pub fn minimize_rule(input: &Vec<Inst>, output: &mut Vec<Inst>) {
                  */
                  // output is smaller, in general (minifier works):
                 assert!(input.len() > output.len());
-                // this pass made it smaller (we made progres):
+                // this pass made it smaller (we made progress):
                 assert!(workvec.len() > output.len());
                 /*
                  * NB: If the above invariant is relaxed, workvec should be
@@ -438,6 +442,18 @@ pub fn evaluate_inst(inst: Inst, input: &mut Vec<u8>) {
                 }
             }
         }
+        ReplaceWithNext(off) => {
+            let off = off as usize;
+            if off + 1 < input.len() {
+                input[off] = input[off+1]
+            }
+        }
+        ReplaceWithFormer(off) => {
+            let off = off as usize;
+            if off != 0 && off < input.len() {
+                input[off] = input[off-1]
+            }
+        }
     }
 }
 
@@ -530,6 +546,8 @@ fn parse_inst1(i: &str) -> IResult<&str, Inst, VerboseError<&str>> {
         alt((
             preceded(char('D'), parse_offset).map(|off| Inst::Omit(off,1)),
             preceded(char('p'), parse_offset).map(|n| Inst::Duplicate(n)),
+            preceded(char('.'), parse_offset).map(|n| Inst::ReplaceWithNext(n)),
+            preceded(char(','), parse_offset).map(|n| Inst::ReplaceWithFormer(n)),
             preceded(char('@'), hashcat_char).map(|ch| Purge(ch)),
             preceded(char('$'), hashcat_char).map(|ch| Append(ch)),
             preceded(char('^'), hashcat_char).map(|ch| Insert{off:0,ch}),
@@ -1326,5 +1344,25 @@ mod tests {
         assert_eq!(arr, [b'c',b'd',b'c',b'd']);
         evaluate_inst(Inst::Purge(b'd'), &mut arr);
         assert_eq!(arr, [b'c',b'c']);
+    }
+
+    /*
+     * tests for .N and ,N
+     */
+    #[test]
+    fn test_evaluate_replace_neighbor() {
+        let mut arr = vec![b'a',b'b',b'c'];
+        evaluate_inst(Inst::ReplaceWithFormer(0), &mut arr);
+        assert_eq!(arr, [b'a',b'b',b'c']);
+        evaluate_inst(Inst::ReplaceWithNext(2), &mut arr);
+        assert_eq!(arr, [b'a',b'b',b'c']);
+        evaluate_inst(Inst::ReplaceWithNext(3), &mut arr);
+        assert_eq!(arr, [b'a',b'b',b'c']);
+        evaluate_inst(Inst::ReplaceWithNext(4), &mut arr);
+        assert_eq!(arr, [b'a',b'b',b'c']);
+        evaluate_inst(Inst::ReplaceWithNext(1), &mut arr);
+        assert_eq!(arr, [b'a',b'c',b'c']);
+        evaluate_inst(Inst::ReplaceWithFormer(1), &mut arr);
+        assert_eq!(arr, [b'a',b'a',b'c']);
     }
 }

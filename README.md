@@ -40,11 +40,90 @@ It looks like this:
 │ MyoTHERward                                     │                                     yotherwardCB │
 ```
 
+### Implemented operations:
+
+```
+# 0 operands:
+:
+l
+u
+r
+d
+{
+}
+[
+]
+k
+K
+
+# 1 operand:
+D
+p
+.
+,
+@
+$
+^
+
+# two operands:
+*
+O
+x
+o
+i
+s
+```
+
+**Not** implemented:
+- `%1s` `/` and `p` positions
+```
+# 0 operands:
+c
+C
+t
+f
+q
+4
+6
+M
+Q
+E
+
+# 1 operand:
+L
+R
++
+-
+y
+Y
+e
+
+T
+'
+z
+Z
+<
+>
+_
+!
+/
+(
+)
+
+# 2 operands:
+=
+%
+
+# 3 operands:
+X
+3
+```
+
 ### Fuzzing
 
 ```shell
 # may need: cargo install cargo-fuzz
 cd rulelib
 cargo fuzz build
-cargo fuzz run fuzz_target_1
+cargo fuzz run fuzz_target_1 -- -max_len=200
 ```

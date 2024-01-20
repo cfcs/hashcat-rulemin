@@ -7,8 +7,8 @@ use rulelib::{ /*Inst,*/
 fuzz_target!(|data: &[u8]| {
     if data.len() < 2 { return; }
     if data.len() > 200 { return; }
-    let pw_len : usize = (data[0] & 31).into();
-    if (data[0] & !31) != 0 {
+    let pw_len : usize = (data[0] & 63).into();
+    if (data[0] & !63) != 0 {
         return;
     }
     if data.len() <= pw_len {
